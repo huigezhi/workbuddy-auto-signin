@@ -13,6 +13,10 @@ import time
 import unittest
 from unittest.mock import patch
 
+# 测试一律不读本机 config.json：否则开发者自己的 exe / webhook 会渗进断言
+os.environ.setdefault("WORKBUDDY_CONFIG", os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "fixtures", "absent-config.json"))
+
 import signin
 
 

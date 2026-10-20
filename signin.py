@@ -34,6 +34,8 @@ WORKBUDDY_AUTH_FILE 指定。任何模式下都不会打印令牌，可安全分
 """
 
 import base64
+import hashlib
+import hmac
 import json
 import math
 import ntpath
@@ -89,6 +91,21 @@ SERVER_RETRY_DELAYS = (3, 10)
 _started_at = None
 _budget_seconds = DEFAULT_BUDGET_SECONDS
 _config_warning = None   # 配置非法时的告警，由 emit 统一带进输出
+_last_emit = None        # 最近一次汇报 (action, out)，供收尾的飞书通知取内容
+
+# 可调项优先读脚本同目录的 config.json（见「配置」一节），WORKBUDDY_CONFIG 可改路径。
+CONFIG_BASENAME = "config.json"
+_CONFIG = None           # 配置文件内容缓存
+_CONFIG_PATH = None      # 缓存对应的路径；路径变了就重读
+_CONFIG_WARNING = None   # 配置文件读取失败时的告警，同样由 emit 带出
+
+# 飞书通知：默认关闭（没配 webhook 就完全不产生副作用）。它跑在主流程之外，
+# 所以超时与重试都不沾主预算——单次 8 秒、不重试。任务时限是 5/10 分钟，
+# 留 8 秒给通知足够；通知失败也只是少一条消息，不能反过来拖垮签到。
+FEISHU_TIMEOUT = 8
+FEISHU_TEXT_LIMIT = 600          # 单行摘要上限，防止一次长汇报把消息撑爆
+FEISHU_TITLE_LIMIT = 80
+FEISHU_POLICIES = ("daily", "error")
 
 # 轮询类命令：预算更短，且空跑不落盘。silent-growth 是 silent-poll 的旧名，
 # 已安装的计划任务还在用它，必须继续认。
@@ -401,7 +418,7 @@ def _windows_registry_runtimes():
 
 
 def find_workbuddy_runtime():
-    override = os.environ.get("WORKBUDDY_EXE")
+    override = _cfg("exe", env="WORKBUDDY_EXE", default="")
     if override:
         path = os.path.abspath(os.path.expanduser(override))
         if not os.path.isfile(path) or (os.name != "nt" and not os.access(path, os.X_OK)):
@@ -529,7 +546,9 @@ def run_doctor(session):
     _validate_session(session)
     kind = _token_format(session["auth"]["accessToken"])
     out = {"result": "AUTH_READY", "credential_format": kind, "needs_attention": False,
-           "report": "本地凭据格式有效；未验证服务端登录状态", "online_checked": False}
+           "report": "本地凭据格式有效；未验证服务端登录状态", "online_checked": False,
+           "config_file": _config_path() if _config() else None,
+           "feishu_configured": bool(_feishu_config())}
     if kind == "sym-v1":
         runtime = find_workbuddy_runtime()
         probe = _run_auth_helper(runtime, {"operation": "probe"})
@@ -546,6 +565,67 @@ def _auth_failure(code):
             "report": "服务端拒绝此操作（HTTP 403），请检查账号权限或活动条件；不能据此判断登录过期"}
 
 
+# ---------------------------------------------------------------- 配置
+# 所有可调项都从这里出：**环境变量 > config.json > 默认值**。老用户把变量写在计划
+# 任务里照样生效；新用户把同一批开关写进一个文件，不必再去改任务定义。配置文件读崩
+# 也不能中断签到——无窗口运行下抛异常等于当天结果凭空消失，只记告警并按默认值继续。
+
+
+def _config_path():
+    """配置文件位置：优先 WORKBUDDY_CONFIG，默认与脚本同目录的 config.json。"""
+    override = os.environ.get("WORKBUDDY_CONFIG")
+    if override:
+        return os.path.abspath(os.path.expanduser(override))
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), CONFIG_BASENAME)
+
+
+def _config():
+    """按路径缓存配置内容；路径变了（测试/多实例）就重新读一次。"""
+    global _CONFIG, _CONFIG_PATH, _CONFIG_WARNING
+    path = _config_path()
+    if _CONFIG is not None and _CONFIG_PATH == path:
+        return _CONFIG
+    _CONFIG_PATH = path
+    _CONFIG = {}
+    _CONFIG_WARNING = None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return _CONFIG                      # 没有配置文件是最常见的情况，不告警
+    except Exception as e:
+        _CONFIG_WARNING = "配置文件 %s 读取失败（%s），已按默认值运行" % (
+            os.path.basename(path), type(e).__name__)
+        return _CONFIG
+    if not isinstance(data, dict):
+        _CONFIG_WARNING = "配置文件 %s 顶层须为 JSON 对象，已按默认值运行" % os.path.basename(path)
+        return _CONFIG
+    _CONFIG = data
+    return _CONFIG
+
+
+def _cfg(*keys, env=None, default=None):
+    """取一个配置值：环境变量 > config.json 的 keys 路径 > default。"""
+    if env:
+        value = os.environ.get(env)
+        if value:                            # 空串视作"没设"，与旧行为一致
+            return value
+    node = _config()
+    for key in keys:
+        if not isinstance(node, dict) or key not in node:
+            return default
+        node = node[key]
+    return default if node is None or node == "" else node
+
+
+def _cfg_flag(*keys, env=None):
+    """开关型配置：布尔直接用，字符串按 1/true/yes/on 判定。"""
+    value = _cfg(*keys, env=env, default=False)
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
 def _parse_budget(default=DEFAULT_BUDGET_SECONDS, maximum=MAX_BUDGET_SECONDS):
     """解析预算环境变量。非法值/越界值一律夹到安全区间——绝不能在这里抛异常。
 
@@ -555,21 +635,21 @@ def _parse_budget(default=DEFAULT_BUDGET_SECONDS, maximum=MAX_BUDGET_SECONDS):
     上限按调用方传入的 maximum 算：轮询任务的 ExecutionTimeLimit 比签到任务短，
     共用一个 540s 的上限等于对轮询任务没有上限，跑穿一样会被杀在写日志之前。
     """
-    raw = os.environ.get("WORKBUDDY_BUDGET_SECONDS")
-    if not raw:
+    raw = _cfg("budget_seconds", env="WORKBUDDY_BUDGET_SECONDS", default=None)
+    if raw is None:
         return default, None
     try:
         val = float(raw)
     except (TypeError, ValueError):
-        return default, "WORKBUDDY_BUDGET_SECONDS=%r 不是数字，已回落 %s 秒" % (
+        return default, "budget_seconds=%r 不是数字，已回落 %s 秒" % (
             raw, int(default))
     if val <= 0:
         # "0" 是非空字符串，用 `or` 兜不住；且 0 会让每个请求都直接放弃，脚本永久失效
-        return default, "WORKBUDDY_BUDGET_SECONDS=%s 必须为正数，已回落 %s 秒" % (
+        return default, "budget_seconds=%s 必须为正数，已回落 %s 秒" % (
             raw, int(default))
     if val > maximum:
         # 上限同样是硬要求：预算大于任务时限就等于没有预算，黑洞式超时会把进程跑到被强杀
-        return maximum, ("WORKBUDDY_BUDGET_SECONDS=%s 超过本命令上限，已夹到 %s 秒"
+        return maximum, ("budget_seconds=%s 超过本命令上限，已夹到 %s 秒"
                          "（须小于该定时任务的 ExecutionTimeLimit）") % (
             raw, int(maximum))
     return val, None
@@ -603,7 +683,7 @@ def find_auth_file():
     返回 (path_or_None, looked_in) —— looked_in 始终是脚本实际检查过的路径列表，
     供 NO_AUTH 报错时显示，避免与代码实现漂移。
     """
-    override = os.environ.get("WORKBUDDY_AUTH_FILE")
+    override = _cfg("auth_file", env="WORKBUDDY_AUTH_FILE", default="")
     if override:
         # 环境变量优先，但文件不存在时单独报告，不给无关建议
         return (override if os.path.exists(override) else None), [override]
@@ -945,11 +1025,6 @@ def _fmt_eta(arrive_at, server_now):
     return "，约 %.1f 小时后回" % (left / 3600.0)
 
 
-def _env_flag(name):
-    """开关型环境变量是否为真；空串与 0/false/no/off 一律视为关。"""
-    return (os.environ.get(name) or "").strip().lower() in ("1", "true", "yes", "on")
-
-
 def _client_token(prefix="u"):
     """活动接口（抽奖/连登兑换）要求的防重放 token。
 
@@ -1008,6 +1083,34 @@ def _dumps(out):
         return repr(out)
 
 
+def _redact(text):
+    """抹掉登记过的敏感值（令牌等）；对非字符串输入保持原样。"""
+    if not isinstance(text, str):
+        return text
+    for value in _sensitive_values:
+        text = text.replace(value, "[REDACTED]")
+    return text
+
+
+def _append_log(payload):
+    """把一行汇报追加到日志；路径不可写时回退脚本同目录。返回是否写入成功。
+
+    抽出来是因为飞书通知失败也要留痕，而"往哪儿写"这件事只该有一份实现。
+    """
+    line = "[%s] %s\n" % (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), payload)
+    default_log = os.path.join(os.path.dirname(os.path.abspath(__file__)), "signin.log")
+    custom_log = _cfg("log", env="WORKBUDDY_SIGNIN_LOG", default="")
+    # 自定义路径不可写时回退到脚本同目录，避免无窗口运行下结果彻底丢失
+    for path in (custom_log or default_log, default_log):
+        try:
+            with open(path, "a", encoding="utf-8") as lf:
+                lf.write(line)
+            return True
+        except Exception:
+            continue
+    return False
+
+
 def emit(out, action):
     """silent 类模式写日志文件，其余模式打印到 stdout；本函数保证不抛异常。
 
@@ -1019,16 +1122,22 @@ def emit(out, action):
     action 不带 silent 前缀，走 stdout 就等于扔进黑洞，无窗口运行下这次失败再没有
     任何痕迹——正是本脚本想杜绝的"当天日志整条丢失"。
     """
+    global _last_emit
     if isinstance(out, dict):
         out = dict(out)
         out.setdefault("needs_attention", out.get("result") in (
             "ERROR", "UNKNOWN", "NETWORK", "TIMEOUT", "NO_AUTH", "NO_SESSION",
             "AUTH_ERROR", "AUTH_REJECTED", "FORBIDDEN"))
-    if _config_warning and isinstance(out, dict):
-        out = dict(out, config_warning=_config_warning)
+    _config()   # 先在第一条输出之前把配置文件读掉，读坏了才能第一时间报出来
+    if _config_warning or _CONFIG_WARNING:
+        warnings = [item for item in (_config_warning, _CONFIG_WARNING) if item]
+        if isinstance(out, dict):
+            out = dict(out, config_warning="；".join(warnings))
     payload = _dumps(out)
     for value in _sensitive_values:
         payload = payload.replace(value, "[REDACTED]")
+    # 收尾的飞书通知从这份记录取内容：emit 是唯一的"结果出口"，挂在它上面就不会漏。
+    _last_emit = (action, out)
     is_error = isinstance(out, dict) and out.get("result") == "ERROR"
     if not str(action).startswith("silent"):
         try:
@@ -1038,16 +1147,185 @@ def emit(out, action):
         except Exception:
             pass  # stdout 不可用（编码/管道问题）时退到日志，至少不把结果丢掉
 
-    line = "[%s] %s\n" % (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), payload)
-    default_log = os.path.join(os.path.dirname(os.path.abspath(__file__)), "signin.log")
-    # 自定义路径不可写时回退到脚本同目录，避免无窗口运行下结果彻底丢失
-    for path in (os.environ.get("WORKBUDDY_SIGNIN_LOG") or default_log, default_log):
+    _append_log(payload)
+
+
+def _clip(text, limit):
+    """压成单行并截断：飞书一条消息装不下整段汇报，摘要要留得住关键信息。"""
+    text = " ".join(str(text).split())
+    return text if len(text) <= limit else text[:limit - 1] + "…"
+
+
+# 运行结果 → 一眼能看懂的状态词。没列到的按"完成"处理，不至于因为新增结果码就崩。
+_FEISHU_STATUS = {
+    "CLAIMED": "✅ 签到成功",
+    "ALREADY": "✅ 今日已签",
+    "GROWTH": "✅ 成长中心",
+    "INACTIVE": "⚪ 活动未开启",
+    "NETWORK": "⚠️ 网络不可达",
+    "TIMEOUT": "⚠️ 超时收尾",
+    "AUTH_ERROR": "🔒 认证异常",
+    "NO_AUTH": "🔒 未找到凭据",
+    "NO_SESSION": "🔒 未登录",
+    "AUTH_REJECTED": "🔒 认证被拒",
+    "FORBIDDEN": "🚫 权限不足",
+    "ERROR": "❌ 运行异常",
+    "UNKNOWN": "❓ 未识别返回",
+}
+
+_FEISHU_TASKS = {
+    "auto": "每日任务",
+    "silent": "每日任务",
+    "silent-poll": "轮询补签",
+    "silent-growth": "轮询补签",
+    "growth": "成长中心",
+}
+
+# 人坐在屏幕前跑的调试命令不推送：那本来就有 stdout 可看。
+_FEISHU_SKIP_ACTIONS = ("doctor", "status", "claim", "all")
+
+
+def _feishu_config():
+    """读取飞书配置；webhook 为空即视为未启用，默认行为与没有这个功能时完全一致。
+
+    只接受 https：webhook 路径本身就是机器人令牌，走明文 http 等于把令牌广播到链路上。
+    """
+    webhook = str(_cfg("feishu", "webhook", env="WORKBUDDY_FEISHU_WEBHOOK", default="")).strip()
+    if not webhook or not webhook.lower().startswith("https://"):
+        return None
+    policy = str(_cfg("feishu", "notify", env="WORKBUDDY_FEISHU_NOTIFY", default="daily")).strip().lower()
+    if policy not in FEISHU_POLICIES:
+        policy = "daily"      # 写错不该让通知整体失效，回落到默认策略
+    at = str(_cfg("feishu", "at", env="WORKBUDDY_FEISHU_AT", default="")).strip()
+    # 自定义机器人拿不到邮箱/手机号，只认 open_id 与 all；写错就当作不 @，
+    # 不能因为一个可选的提醒对象把整条通知搞挂。
+    if not (at == "all" or re.fullmatch(r"ou_[0-9A-Za-z]{8,64}", at or "")):
+        at = ""
+    secret = str(_cfg("feishu", "secret", env="WORKBUDDY_FEISHU_SECRET", default="")).strip()
+    # 登记进敏感值：万一被异常信息带出来，emit 也会打码
+    for value in (webhook, secret):
+        if len(value) >= 8:
+            _sensitive_values.add(value)
+    return {"webhook": webhook, "secret": secret, "at": at, "policy": policy}
+
+
+def _feishu_sign(timestamp, secret):
+    """自定义机器人签名：以 "<timestamp>\\n<secret>" 为密钥，对空串做 HMAC-SHA256 再 base64。"""
+    key = ("%s\n%s" % (timestamp, secret)).encode("utf-8")
+    return base64.b64encode(hmac.new(key, b"", hashlib.sha256).digest()).decode("ascii")
+
+
+def _feishu_due(action, out, cfg):
+    """这次运行要不要推送。
+
+    daily（默认）：每日任务跑完必发；此外任何一次失败都发——轮询失败也算，否则
+                   00:05 那次挂了要等到第二天才发现。
+    error       ：只在 needs_attention 时发，适合只想被叫醒的场景。
+    """
+    if not cfg or action in _FEISHU_SKIP_ACTIONS:
+        return False
+    attention = bool(out.get("needs_attention"))
+    if cfg["policy"] == "error":
+        return attention
+    return action in ("auto", "silent") or attention
+
+
+def _feishu_lines(action, out):
+    """把一次运行的汇报压成几行：状态 → 结果 → 成长 → 积分 → 待处理。"""
+    lines = ["状态：%s · %s" % (
+        _FEISHU_STATUS.get(str(out.get("result") or ""), "完成"),
+        _FEISHU_TASKS.get(action, str(action)))]
+    report = _redact(str(out.get("report") or "")).strip()
+    if report:
+        lines.append("结果：%s" % _clip(report, FEISHU_TEXT_LIMIT))
+    growth = _redact(str(out.get("growth") or "")).strip()
+    # 领到东西时 run_daily 已经把成长摘要拼进 report，别重复念一遍
+    if growth and growth not in report:
+        lines.append("成长：%s" % _clip(growth, FEISHU_TEXT_LIMIT))
+    bits = []
+    if out.get("credit") is not None:
+        bits.append("+%s 积分" % fmt_credit(out["credit"]))
+    elif out.get("today_credit") is not None:
+        bits.append("今日 +%s" % fmt_credit(out["today_credit"]))
+    if out.get("streak_days") is not None:
+        bits.append("连续 %s 天" % out["streak_days"])
+    if out.get("total_credits") is not None:
+        bits.append("累计 %s 积分" % fmt_credit(out["total_credits"]))
+    if bits:
+        lines.append("积分：%s" % "，".join(bits))
+    if out.get("needs_attention"):
+        reason = out.get("reason") or out.get("growth_result") or ""
+        # 失败原因已经写在 report 里就不再重复；没有才回落到 reason
+        detail = "见日志" if (not reason or str(reason) in report) else _redact(str(reason))
+        lines.append("待处理：%s" % _clip(detail, FEISHU_TEXT_LIMIT))
+    return lines
+
+
+def _feishu_payload(cfg, action, out):
+    """构造消息体：post 富文本，带标题；配了接收人就追加一个 @。"""
+    title = _clip("WorkBuddy 签到 · %s · %s" % (
+        _FEISHU_STATUS.get(str(out.get("result") or ""), "完成"),
+        datetime.now().strftime("%m-%d %H:%M")), FEISHU_TITLE_LIMIT)
+    content = [[{"tag": "text", "text": line}] for line in _feishu_lines(action, out)]
+    if cfg.get("at"):
+        content.append([{"tag": "at", "user_id": cfg["at"]},
+                        {"tag": "text", "text": " 请留意"}])
+    payload = {"msg_type": "post",
+               "content": {"post": {"zh_cn": {"title": title, "content": content}}}}
+    if cfg.get("secret"):
+        timestamp = str(int(time.time()))
+        payload["timestamp"] = timestamp
+        payload["sign"] = _feishu_sign(timestamp, cfg["secret"])
+    return payload
+
+
+def _feishu_send(cfg, action, out):
+    """推送一条消息，返回 (是否成功, 失败原因)。
+
+    原因里只允许出现固定文案与数字——webhook 令牌就在 URL 里，任何把它拼进错误
+    信息的写法都会让它随日志扩散。
+    """
+    code, body = _request(cfg["webhook"], {"Content-Type": "application/json"},
+                          method="POST", payload=_feishu_payload(cfg, action, out),
+                          timeout=FEISHU_TIMEOUT)
+    if code == CODE_NO_NETWORK:
+        return False, "网络不可达"
+    if not 200 <= code < 300:
+        return False, "HTTP %s" % code
+    if isinstance(body, dict) and body.get("code") not in (None, 0):
+        return False, "飞书返回 code=%s" % body.get("code")
+    if isinstance(body, dict) and body.get("StatusCode") not in (None, 0):
+        return False, "飞书返回 StatusCode=%s" % body.get("StatusCode")
+    return True, ""
+
+
+def notify_run():
+    """任务收尾后按配置推送飞书；返回 None/ok/失败原因，任何异常都在这里吞掉。
+
+    刻意不用 _request_with_retry：它吃的是主预算，而走到这一步时预算可能已见底，
+    通知既不该把已经成功的签到改判成失败，也不该把进程拖到被任务时限强杀。
+    """
+    try:
+        cfg = _feishu_config()
+        if not cfg or _last_emit is None:
+            return None
+        action, out = _last_emit
+        if not isinstance(out, dict) or not _feishu_due(action, out, cfg):
+            return None
+        ok, reason = _feishu_send(cfg, action, out)
+        if ok:
+            return "ok"
+        _append_log(_dumps({"feishu": "failed", "reason": reason,
+                            "needs_attention": False}))
+        return reason
+    except Exception as e:
+        # 通知失败只落一行日志：主流程该返回什么退出码就返回什么
         try:
-            with open(path, "a", encoding="utf-8") as lf:
-                lf.write(line)
-            return
+            _append_log(_dumps({"feishu": "failed", "reason": type(e).__name__,
+                                "needs_attention": False}))
         except Exception:
-            continue
+            pass
+        return type(e).__name__
 
 
 def _is_already_checked_in(cbody):
@@ -1679,18 +1957,24 @@ def run_daily(headers, endpoint):
 
 
 def main():
-    """薄壳：只负责取命令 + 兜住一切异常，保证 silent 模式下结果必定落盘。"""
+    """薄壳：取命令 + 兜住一切异常，保证 silent 模式下结果必定落盘，收尾顺带发通知。"""
     action = sys.argv[1] if len(sys.argv) > 1 else "auto"
     try:
-        return _run(action)
+        code = _run(action)
     except AuthError as e:
         emit(e.output(), action)
-        return 1
+        code = 1
     except Exception as e:
         # 无窗口运行下任何未捕获异常都会让当天的失败无痕消失，这里是最后一道防线
         emit({"result": "ERROR", "report": "脚本运行异常（%s）" % type(e).__name__,
               "needs_attention": True}, action)
-        return 2
+        code = 2
+    # 放在所有结果都已经落盘之后：通知是附加值，失败也不改退出码
+    try:
+        notify_run()
+    except Exception:
+        pass
+    return code
 
 
 def _run(action):
@@ -1703,13 +1987,15 @@ def _run(action):
         return 2
 
     auth_file, looked_in = find_auth_file()
-    env_override = os.environ.get("WORKBUDDY_AUTH_FILE")
+    # 显式配置过（环境变量或 config.json）却没找到文件，要单独说清楚，别给无关建议
+    env_override = _cfg("auth_file", env="WORKBUDDY_AUTH_FILE", default="")
     if not auth_file or not os.path.exists(auth_file):
         if env_override:
-            report = ("WORKBUDDY_AUTH_FILE 指向的文件不存在：%s" % env_override)
+            report = ("配置的 auth_file 指向的文件不存在：%s" % env_override)
         else:
             report = ("未找到 WorkBuddy 登录凭据。请先在本机登录 WorkBuddy 桌面端；"
-                      "或设置环境变量 WORKBUDDY_AUTH_FILE 指向 workbuddy-desktop.info。")
+                      "或在 config.json 里填 auth_file（或设环境变量 WORKBUDDY_AUTH_FILE）"
+                      "指向 workbuddy-desktop.info。")
         emit({"result": "NO_AUTH", "report": report, "looked_in": looked_in,
               "needs_attention": True}, action)
         return 2
@@ -1762,7 +2048,7 @@ def _run(action):
         # 淹没在一串"Buddy 旅行中"里。要看完整过程就设 WORKBUDDY_GROWTH_LOG_EMPTY=1。
         code, out, quiet = run_daily(headers, endpoint)
         out["trigger"] = "poll"
-        if (not quiet) or _env_flag("WORKBUDDY_GROWTH_LOG_EMPTY"):
+        if (not quiet) or _cfg_flag("log_empty_polls", env="WORKBUDDY_GROWTH_LOG_EMPTY"):
             emit(out, action)
         return code
 

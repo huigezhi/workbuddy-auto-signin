@@ -1,0 +1,13 @@
+{
+  "auth_file": "",
+  "exe": "",
+  "log": "",
+  "budget_seconds": null,
+  "log_empty_polls": false,
+  "feishu": {
+    "webhook": "",
+    "secret": "",
+    "notify": "daily",
+    "at": ""
+  }
+}

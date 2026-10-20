@@ -330,13 +330,43 @@ Windows 按 `WORKBUDDY_EXE → 默认安装目录 → 注册表` 的顺序发现
 
 ## 🔧 配置
 
-| 环境变量 | 作用 |
-|---|---|
-| `WORKBUDDY_AUTH_FILE` | 自动探测失败时，手动指定凭据文件路径 |
-| `WORKBUDDY_EXE` | 指定与加密凭据对应的客户端**可执行文件**；Windows 为 `WorkBuddy.exe`，macOS 为 `.app/Contents/MacOS/` 内实际可执行文件。路径错误时直接报告，不静默回退 |
-| `WORKBUDDY_SIGNIN_LOG` | `silent` 模式下日志文件路径（默认 `signin.log`） |
-| `WORKBUDDY_BUDGET_SECONDS` | 单次运行的网络请求时间预算。签到类命令默认 `420`（7 分钟）、上限 `540`；`silent-poll` / `silent-growth` 轮询默认 `180`、上限 `240`。**Windows 上须为正数且小于对应计划任务的 `ExecutionTimeLimit`**（macOS launchd 无此限制）。非法值、`≤0` 或超上限都会夹到安全值，并在输出里附 `config_warning` |
-| `WORKBUDDY_GROWTH_LOG_EMPTY` | 设为 `1`（或 `true`/`yes`/`on`）时，`silent-poll` 连空跑也写日志；默认只在领到东西或出错时记录 |
+所有可调项集中在**一个配置文件**里，环境变量仍然可用。优先级只有一条：**环境变量 > `config.json` > 默认值**——老配置写在计划任务里的照样生效，不必迁移。
+
+```bash
+cp config.example.json config.json     # 与 signin.py 同目录
+```
+
+```json
+{
+  "auth_file": "",
+  "exe": "E:\\WorkBuddy\\WorkBuddy.exe",
+  "log": "",
+  "budget_seconds": null,
+  "log_empty_polls": false,
+  "feishu": {
+    "webhook": "https://open.feishu.cn/open-apis/bot/v2/hook/xxxxxxxx-xxxx",
+    "secret": "",
+    "notify": "daily",
+    "at": ""
+  }
+}
+```
+
+| `config.json` 键 | 对应环境变量 | 作用 |
+|---|---|---|
+| `auth_file` | `WORKBUDDY_AUTH_FILE` | 自动探测失败时，手动指定凭据文件路径 |
+| `exe` | `WORKBUDDY_EXE` | 指定与加密凭据对应的客户端**可执行文件**；Windows 为 `WorkBuddy.exe`，macOS 为 `.app/Contents/MacOS/` 内实际可执行文件。路径错误时直接报告，不静默回退 |
+| `log` | `WORKBUDDY_SIGNIN_LOG` | `silent` 模式下日志文件路径（默认脚本同目录 `signin.log`） |
+| `budget_seconds` | `WORKBUDDY_BUDGET_SECONDS` | 单次运行的网络请求时间预算。签到类命令默认 `420`（7 分钟）、上限 `540`；`silent-poll` / `silent-growth` 轮询默认 `180`、上限 `240`。**Windows 上须为正数且小于对应计划任务的 `ExecutionTimeLimit`**（macOS launchd 无此限制）。非法值、`≤0` 或超上限都会夹到安全值，并在输出里附 `config_warning` |
+| `log_empty_polls` | `WORKBUDDY_GROWTH_LOG_EMPTY` | 为真时 `silent-poll` 连空跑也写日志；默认只在领到东西或出错时记录 |
+| `feishu` | `WORKBUDDY_FEISHU_*` | 飞书通知（可选，默认关闭），见下方「🔔 飞书通知」 |
+
+配置文件本身的位置也可以用 `WORKBUDDY_CONFIG` 指定（例如多个实例各用一份）。
+
+> [!IMPORTANT]
+> `config.json` 里会有飞书 webhook 令牌，所以它默认**不进版本库**（`.gitignore` 已忽略，仓库里只有 `config.example.json`）。
+>
+> 文件写坏不会中断签到：只会附一条 `config_warning` 并按默认值继续跑；`python signin.py doctor` 的 `config_file` / `feishu_configured` 字段可以直接看到当前生效的是哪份配置。
 
 > [!NOTE]
 > 时间预算须小于计划任务的 `ExecutionTimeLimit`。两个任务的时限不同，所以上限也分开算：签到任务 PT10M → 上限 `540`，轮询任务 PT5M → 上限 `240`，各留 60 秒给解释器启动和收尾。网络异常时单个请求最坏要耗 30 秒，若不设上限，接口逐个超时会把任务跑穿被系统强杀——而结果是在最后才写日志的，当天记录会整条丢失。预算耗尽时脚本主动收尾并如实记录，剩余项留到下次。
@@ -344,6 +374,56 @@ Windows 按 `WORKBUDDY_EXE → 默认安装目录 → 注册表` 的顺序发现
 > 若你要调整某个任务的 `ExecutionTimeLimit`，须同步改 `signin.py` 顶部对应的 `MAX_BUDGET_SECONDS` / `POLL_MAX_BUDGET_SECONDS`（分别对应签到任务与轮询任务）。
 >
 > macOS 的 launchd **没有** `ExecutionTimeLimit` 这类外部时限，不会把跑久了的任务强杀，所以上面的上限只是 Windows 侧的约束；macOS 上脚本内置的时间预算就是唯一的兜底，保持默认即可。
+
+---
+
+## 🔔 飞书通知（可选）
+
+默认关闭：不配 webhook 时行为与之前完全一致——不发请求、不写额外日志、不影响退出码。
+
+开启方式：在飞书群里添加「自定义机器人」，把它的 webhook 填进 `config.json` 的 `feishu` 段。
+
+```json
+{
+  "feishu": {
+    "webhook": "https://open.feishu.cn/open-apis/bot/v2/hook/xxxxxxxx-xxxx",
+    "secret": "",
+    "notify": "daily",
+    "at": ""
+  }
+}
+```
+
+不想改文件也可以继续用环境变量（优先级更高）：
+
+```bash
+# Windows：当前用户永久生效，之后新开的计划任务进程都能读到
+setx WORKBUDDY_FEISHU_WEBHOOK "https://open.feishu.cn/open-apis/bot/v2/hook/xxxxxxxx-xxxx"
+# macOS / Linux
+export WORKBUDDY_FEISHU_WEBHOOK="https://open.feishu.cn/open-apis/bot/v2/hook/xxxxxxxx-xxxx"
+```
+
+| `feishu` 字段 | 环境变量 | 作用 |
+|---|---|---|
+| `webhook` | `WORKBUDDY_FEISHU_WEBHOOK` | 群机器人 webhook，唯一必填项。只接受 `https://`——webhook 路径本身就是机器人令牌，不能走明文 |
+| `secret` | `WORKBUDDY_FEISHU_SECRET` | 机器人开了「签名校验」时填这里，脚本自动带上 `timestamp` + `sign` |
+| `notify` | `WORKBUDDY_FEISHU_NOTIFY` | `daily`（默认）：每日任务跑完必发，另外任何一次失败都发；`error`：只在需要人处理时发 |
+| `at` | `WORKBUDDY_FEISHU_AT` | 追加 @ 提醒：填用户 open_id（`ou_` 开头）或 `all`。填错按「不 @」处理，不影响整条消息 |
+
+**推送时机**（默认策略）
+
+| 场景 | 是否推送 |
+|---|---|
+| 每天 `00:05` 的签到任务（`auto` / `silent`） | 一定推送，今天已签也推 |
+| `silent-poll` 空跑（已签且成长中心无可领取项） | 不推 |
+| 任意一次运行需要人处理（网络 / 认证 / 权限 / 异常） | 推 |
+| `doctor` / `status` / `claim` / `all` | 不推（人就在屏幕前） |
+
+**消息内容**：一行状态（把结果码翻成人话）、本次摘要、成长中心产出、积分与连签、以及需要处理时的原因。每行按 600 字截断，完整内容仍在 `signin.log`。
+
+**关于「发给个人」**：飞书自定义机器人只能发到它所在的群。想落到个人，建一个只拉自己的群、把机器人拉进去就行；`WORKBUDDY_FEISHU_AT` 用来在群里精确 @ 某人（open_id）。两条路都不需要企业自建应用。
+
+> 通知跑在主流程收尾之后：单次 8 秒、不重试、不消耗主时间预算，发送失败只在 `signin.log` 留一行 `{"feishu": "failed", "reason": ...}`，签到结果与退出码不受影响。
 
 ---
 
@@ -367,6 +447,8 @@ Windows 按 `WORKBUDDY_EXE → 默认安装目录 → 注册表` 的顺序发现
 | `TIMEOUT / 已达本次运行时间预算` | 网络严重超时导致预算耗尽，已领到的部分照常记录，剩余项下次再领 |
 | `ERROR / 登录凭据文件不是合法 JSON` | 本地凭据文件损坏——重新登录一次 WorkBuddy 桌面端即可重建 |
 | `ERROR / 脚本运行异常（...）` | 异常不会静默丢失：`silent` 模式会写进 `signin.log`；可重跑 `python signin.py status` 看原始返回 |
+| `signin.log` 里出现 `{"feishu": "failed", ...}` | 只是通知没发出去，签到本身照常。`网络不可达` / `HTTP 4xx` 查本机网络与 webhook 是否还有效；`飞书返回 code=19021` 是签名不匹配，核对 `WORKBUDDY_FEISHU_SECRET`；`code=19024` 多为关键词或 IP 白名单限制 |
+| 配了 webhook 却收不到消息 | 先看地址是不是 `https://open.feishu.cn/open-apis/bot/v2/hook/…`；`daily` 策略下轮询空跑本就不发；调试命令也不发 |
 | 00:05 那次失败，连签却没断 | 正常——轮询任务（01/05/09/13/17/21 点）会先查状态，未签就补上。补签那轮日志会带 `"trigger": "poll"` |
 | 连登兑换「进阶」未解锁（连登天数不足） | 正常——三档分别要连登满 7 / 14 / 28 天，天数不够时服务端返回 403，脚本按常态处理，不记为失败 |
 | 旧日志反复出现 `date is not broken, no makeup needed` | 旧版误把已补登记录当作待补日期；更新脚本即可。新版从活跃日历选断点；查询后日期已被补上的情况按正常状态跳过 |

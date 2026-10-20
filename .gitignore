@@ -7,3 +7,6 @@ __pycache__/
 .workbuddy/
 signin.log
 qoder_signin.log
+
+# 本机配置：含飞书 webhook 令牌，只提交 config.example.json
+config.json
